@@ -1,124 +1,160 @@
 import streamlit as st
 import numpy as np
 import pandas as pd
-from scipy.stats import gamma  # for reference, though we use np.random.gamma below
 
-st.title("Experiment Winner Calculator")
+st.title("Bayesian Test for Difference in CPA")
+
 st.write(
     """
-This calculator uses a Bayesian approach (similar in spirit to the methodology used by Meta Ads)
-to determine which experiment cell is the winner.
-For each cell, enter the amount spent and the number of conversions.
-The app computes a posterior conversion rate (conversions per unit spend),
-estimates 95% credible intervals, and calculates the winning probability.
-A cell is declared the winner if its winning probability is 95% or above.
+Compare two cells (A and B) based on **Cost per Acquisition (CPA)** using a
+Bayesian Gamma-Poisson model. 
+
+### How it works:
+1. We assume each cell's _conversion rate_ (conversions per dollar spent) has a Gamma(\u03B1, \u03B2) prior.
+2. Observed data: Cell i has `Spent_i` (total $) and `Conversions_i`.
+3. Posterior for the rate \u03BB_i is Gamma(\u03B1_post, \u03B2_post).
+4. We **invert** samples from the rate distribution to get a distribution for CPA_i = 1 / \u03BB_i.
+5. We compare CPA_A vs. CPA_B to find:
+   - Probability( CPA_A < CPA_B )
+   - 95% credible intervals for each CPA
+   - Which cell is likely to have a lower CPA.
 """
 )
 
-# Ask for the number of experiment groups (cells)
-n_cells = st.number_input("Number of Experiment Groups (Cells)", min_value=2, value=2, step=1)
+# Create a form to group inputs together
+with st.form("cpa_form"):
+    st.subheader("Cell A Inputs")
+    spent_A = st.number_input(
+        "Spent (Cell A)", 
+        min_value=0.0, 
+        value=100.0, 
+        step=1.0, 
+        key="spent_A"
+    )
+    conv_A = st.number_input(
+        "Conversions (Cell A)", 
+        min_value=0, 
+        value=10, 
+        step=1, 
+        key="conv_A"
+    )
 
-st.write("### Enter Data for Each Cell")
-# Use a form so the user can enter all data then click “Calculate”
-with st.form("input_form"):
-    cells = []
-    # For each cell, get its name, amount spent, and conversions.
-    for i in range(int(n_cells)):
-        st.subheader(f"Cell {i+1}")
-        cell_name = st.text_input(f"Cell {i+1} Name", value=f"Cell {i+1}", key=f"cell_name_{i}")
-        spent = st.number_input(
-            f"Amount Spent for {cell_name}",
-            min_value=0.0,
-            value=100.0,
-            step=1.0,
-            key=f"spent_{i}",
-            help="Enter the amount of money spent (for example, in dollars)."
-        )
-        conversions = st.number_input(
-            f"Number of Conversions for {cell_name}",
-            min_value=0,
-            value=10,
-            step=1,
-            key=f"conv_{i}",
-            help="Enter the total number of conversions observed."
-        )
-        cells.append({"name": cell_name, "spent": spent, "conversions": conversions})
+    st.subheader("Cell B Inputs")
+    spent_B = st.number_input(
+        "Spent (Cell B)", 
+        min_value=0.0, 
+        value=100.0, 
+        step=1.0, 
+        key="spent_B"
+    )
+    conv_B = st.number_input(
+        "Conversions (Cell B)", 
+        min_value=0, 
+        value=12, 
+        step=1, 
+        key="conv_B"
+    )
+
+    # Let user pick a threshold for "winning probability"
+    threshold = st.selectbox(
+        "Winning Probability Threshold", 
+        [0.95, 0.90, 0.80], 
+        index=0, 
+        key="prob_threshold"
+    )
+
+    # The form submit button
     submitted = st.form_submit_button("Calculate")
 
 if submitted:
-    st.write("## Results")
+    # Basic validation
+    if spent_A <= 0 or spent_B <= 0:
+        st.error("Please enter positive spend for both cells.")
+        st.stop()
+    if conv_A < 0 or conv_B < 0:
+        st.error("Please enter non-negative conversions.")
+        st.stop()
 
-    # --- Bayesian Analysis Setup ---
-    # We assume that conversions arise as a Poisson process with rate λ (conversions per dollar spent).
-    # With a Gamma(α, β) prior on λ, and assuming:
-    #    conversions ~ Poisson(λ * spent)
-    # the posterior is also Gamma distributed with parameters:
-    #    α_post = α_prior + conversions
-    #    β_post = β_prior + spent
-    #
-    # Here we choose a relatively noninformative prior: Gamma(1, 1)
-    alpha_prior = 1
-    beta_prior = 1
+    # --- Bayesian setup ---
+    # Prior: Gamma(alpha_prior, beta_prior), fairly uninformative:
+    alpha_prior = 1.0
+    beta_prior = 1.0
 
-    n_samples = 100000  # number of simulation draws
-    cell_samples = {}   # to store simulation draws for each cell
-    results = []        # to store summary statistics for each cell
+    # Posterior parameters for each cell:
+    #    alpha_post = alpha_prior + conversions
+    #    beta_post  = beta_prior  + spend
+    alpha_post_A = alpha_prior + conv_A
+    beta_post_A = beta_prior + spent_A
 
-    # For each cell, compute posterior parameters and simulate draws
-    for cell in cells:
-        # Compute the posterior parameters
-        alpha_post = alpha_prior + cell["conversions"]
-        beta_post = beta_prior + cell["spent"]
-        # Draw samples from Gamma(alpha_post, scale=1/beta_post)
-        samples = np.random.gamma(alpha_post, 1.0 / beta_post, n_samples)
-        cell_samples[cell["name"]] = samples
+    alpha_post_B = alpha_prior + conv_B
+    beta_post_B = beta_prior + spent_B
 
-        # Compute summary statistics:
-        posterior_mean = alpha_post / beta_post
-        ci_lower = np.percentile(samples, 2.5)
-        ci_upper = np.percentile(samples, 97.5)
-        observed_rate = cell["conversions"] / cell["spent"] if cell["spent"] > 0 else np.nan
+    # Sample from posterior of each cell's rate (lambda = conversions/$)
+    n_samples = 100_000
+    rate_samples_A = np.random.gamma(shape=alpha_post_A, scale=1.0/beta_post_A, size=n_samples)
+    rate_samples_B = np.random.gamma(shape=alpha_post_B, scale=1.0/beta_post_B, size=n_samples)
 
-        results.append({
-            "Cell": cell["name"],
-            "Amount Spent": cell["spent"],
-            "Conversions": cell["conversions"],
-            "Observed Rate (Conversions/Spend)": observed_rate,
-            "Posterior Mean": posterior_mean,
-            "95% CI Lower": ci_lower,
-            "95% CI Upper": ci_upper,
-            # We will add "Winning Probability" below.
-        })
+    # Convert rate samples to CPA samples: CPA = 1 / rate
+    cpa_samples_A = 1.0 / rate_samples_A
+    cpa_samples_B = 1.0 / rate_samples_B
 
-    # --- Determine the Winning Probability ---
-    # Stack the simulation draws for all cells into a 2D array.
-    # Each row corresponds to a cell.
-    cell_names = list(cell_samples.keys())
-    samples_array = np.vstack([cell_samples[name] for name in cell_names])
-    # For each simulation draw (each column), determine which cell had the highest lambda
-    winners = np.argmax(samples_array, axis=0)
-    # Count how often each cell “wins”
-    win_counts = np.bincount(winners, minlength=len(cell_names))
-    win_probabilities = win_counts / n_samples
+    # Compute posterior means, medians, and 95% credible intervals
+    cpa_mean_A = np.mean(cpa_samples_A)
+    cpa_mean_B = np.mean(cpa_samples_B)
 
-    # Add the winning probability to each cell’s results.
-    for i, name in enumerate(cell_names):
-        for result in results:
-            if result["Cell"] == name:
-                result["Winning Probability"] = win_probabilities[i]
+    cpa_median_A = np.median(cpa_samples_A)
+    cpa_median_B = np.median(cpa_samples_B)
 
-    # --- Declare a Winner (if any) ---
-    # For this example, we declare a winner if the cell’s winning probability is at least 95%.
-    winner_row = max(results, key=lambda x: x["Winning Probability"])
-    if winner_row["Winning Probability"] >= 0.95:
+    cpa_ci95_A = np.percentile(cpa_samples_A, [2.5, 97.5])
+    cpa_ci95_B = np.percentile(cpa_samples_B, [2.5, 97.5])
+
+    # Probability that A's CPA is lower than B's
+    prob_A_lower = np.mean(cpa_samples_A < cpa_samples_B)
+    prob_B_lower = 1 - prob_A_lower
+
+    # Observed CPA
+    observed_cpa_A = (spent_A / conv_A) if conv_A > 0 else np.nan
+    observed_cpa_B = (spent_B / conv_B) if conv_B > 0 else np.nan
+
+    # Summarize results in a DataFrame
+    df = pd.DataFrame(
+        {
+            "Cell": ["A", "B"],
+            "Spent": [spent_A, spent_B],
+            "Conversions": [conv_A, conv_B],
+            "Observed CPA (Spent/Conversions)": [
+                observed_cpa_A,
+                observed_cpa_B,
+            ],
+            "Posterior Mean CPA": [cpa_mean_A, cpa_mean_B],
+            "Median CPA": [cpa_median_A, cpa_median_B],
+            "95% Credible Interval (Lower)": [cpa_ci95_A[0], cpa_ci95_B[0]],
+            "95% Credible Interval (Upper)": [cpa_ci95_A[1], cpa_ci95_B[1]],
+        }
+    )
+
+    st.subheader("Posterior Estimates of CPA")
+    st.dataframe(df.style.format(precision=4))
+
+    st.markdown(
+        f"""
+        **Probability that Cell A has a lower CPA than Cell B** = {prob_A_lower:.3f}  
+        **Probability that Cell B has a lower CPA than Cell A** = {prob_B_lower:.3f}  
+        """
+    )
+
+    # Declare a winner if above threshold
+    if prob_A_lower >= threshold:
         st.success(
-            f"The winner is **{winner_row['Cell']}** with a winning probability of "
-            f"{winner_row['Winning Probability']*100:.1f}%."
+            f"**Cell A** is the winner with probability "
+            f"{prob_A_lower:.1%} of having a lower CPA."
+        )
+    elif prob_B_lower >= threshold:
+        st.success(
+            f"**Cell B** is the winner with probability "
+            f"{prob_B_lower:.1%} of having a lower CPA."
         )
     else:
-        st.info("No cell has reached the 95% confidence threshold to be declared a winner.")
-
-    # Display detailed results in a table.
-    df_results = pd.DataFrame(results)
-    st.write("### Detailed Results per Cell")
-    st.dataframe(df_results)
+        st.info(
+            f"Neither cell has reached the {threshold*100:.0f}% winning probability threshold."
+        )
